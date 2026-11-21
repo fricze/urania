@@ -8,6 +8,7 @@
   (:require [acp]
             [cui.core :as ui]
             [cui.raw :as raw]
+            [clojure.java.io :as io]
             [clojure.string :as str]))
 
 (def agent-cmd ["npx" "-y" "@agentclientprotocol/claude-agent-acp"])
@@ -30,6 +31,8 @@
 (def branch-open (atom false))
 (def branch-quote (atom ""))
 (def branch-ask (atom ""))
+(def chats-dir (str (System/getProperty "user.home") "/Muse"))
+(def save-error (atom nil))
 
 (defn now [] (System/currentTimeMillis))
 
@@ -86,7 +89,7 @@
 
 (defn on-update [{:keys [sessionId update]}]
   (let [u update]
-    (case (:sessionUpdate u)
+    (case (when-not (:restoring (some->> (chat-idx sessionId) (get @chats))) (:sessionUpdate u))
       "agent_message_chunk" (when-let [t (-> u :content :text)] (update-turn! sessionId #(add-text % t)))
       "agent_thought_chunk" (when-let [t (-> u :content :text)] (update-turn! sessionId #(update % :thought str t)))
       "tool_call" (update-turn! sessionId
@@ -109,11 +112,13 @@
         (reset! perm-open true))
     (acp/respond-error! c id -32601 (str "Method not supported: " method))))
 
-(defn answer-permission! [outcome]
-  (let [p (first @perms)]
-    (swap! perms subvec 1)
-    (reset! perm-open (boolean (seq @perms)))
-    (acp/respond! @conn (:id p) {:outcome outcome})))
+(defn answer-permission!
+  "Answers queued request p (default: the one on screen) and drops it."
+  ([outcome] (answer-permission! (first @perms) outcome))
+  ([p outcome]
+   (swap! perms (fn [ps] (filterv #(not= p %) ps)))
+   (reset! perm-open (boolean (seq @perms)))
+   (acp/respond! @conn (:id p) {:outcome outcome})))
 
 ;; ---- talking to the agent
 
@@ -129,7 +134,7 @@
   or session/fork). (on-ready i) runs once the session exists."
   [chat method params on-ready]
   (let [i (count @chats)]
-    (swap! chats conj (merge {:title "New chat" :turns [] :plan []} chat))
+    (swap! chats conj (merge {:title "New chat" :turns [] :plan [] :cwd @cwd :created (now)} chat))
     (reset! current i)
     (acp/request! @conn method (merge {:cwd @cwd :mcpServers []} params)
                   (fn [r e]
@@ -152,7 +157,26 @@
 
 (defn new-chat! [] (open-session! {} "session/new" {} nil))
 
-(declare send-prompt!)
+(declare send-prompt! send-prompt*)
+
+(defn ensure-live!
+  "Runs (k) once chat i has a live session. A chat restored from disk is
+  reopened with session/load first; the history the agent replays is
+  ignored, since the chat already shows it."
+  [i k]
+  (let [{:keys [sid restored busy] c-cwd :cwd} (get @chats i)]
+    (cond
+      (not restored) (k)
+      busy nil
+      :else (do (update-chat! sid assoc :busy true :restoring true)
+                (acp/request! @conn "session/load" {:sessionId sid :cwd (or c-cwd @cwd) :mcpServers []}
+                              (fn [_ e]
+                                (update-chat! sid assoc :busy false :restoring false :restored (boolean e))
+                                (if e
+                                  (update-chat! sid update :turns conj
+                                                {:role :agent :done true
+                                                 :items [{:type :error :text (str "Could not reopen this chat: " (:message e))}]})
+                                  (k))))))))
 
 (defn blocks
   "Splits a markdown reply into the parts you can quote: paragraphs and list
@@ -184,31 +208,126 @@
     (when (and psid (not (str/blank? text)))
       ;; ponytail: the fork carries the whole parent conversation, also turns after
       ;; the quoted one; the quote is what points Claude at the right part
-      (open-session! {:title (if (> (count title) 40) (str (subs title 0 40) "…") title)
-                      :parent parent :from turn}
-                     "session/fork" {:sessionId psid}
-                     #(send-prompt! % text)))))
+      (ensure-live! parent
+                    #(open-session! {:title (if (> (count title) 40) (str (subs title 0 40) "…") title)
+                                     :parent parent :from turn}
+                                    "session/fork" {:sessionId psid}
+                                    (fn [i] (send-prompt! i text)))))))
+
+;; ---- saving chats as markdown, one file per chat in chats-dir
+
+(defn file-name [{:keys [title sid]}]
+  (let [s (str/replace (str/lower-case (or title "chat")) #"[^\p{L}\p{N}]+" "-")
+        s (str/replace (subs s 0 (min 60 (count s))) #"^-+|-+$" "")]
+    (str (if (str/blank? s) "chat" s) "-" (subs sid 0 (min 8 (count sid))) ".md")))
+
+(defn turn->md [t]
+  (if (= :user (:role t))
+    (str "## You\n\n" (:text t))
+    (str/join "\n\n"
+              (concat ["## Claude"]
+                      (when (seq (:thought t))
+                        [(str "<details><summary>Thinking</summary>\n\n" (:thought t) "\n\n</details>")])
+                      (for [it (:items t)]
+                        (case (:type it)
+                          :text (:text it)
+                          :tool (str "- Tool: **" (or (:title it) "Tool") "** (" (or (:kind it) "tool") ", " (:status it) ")")
+                          :error (str "> **Error:** " (:text it))
+                          :note (str "_" (:text it) "_")))))))
+
+(defn chat->data
+  "What load-chats needs to rebuild chat i; the parent by session id, since
+  indices change between runs."
+  [cs i]
+  (let [{:keys [parent] :as c} (cs i)]
+    (cond-> (select-keys c [:title :sid :cwd :created :from :turns])
+      parent (assoc :parentSid (:sid (cs parent))))))
+
+(defn chat->md
+  "Chat i as markdown. names holds every chat's file name, for the links
+  between a chat and its subchats."
+  [cs names i]
+  (let [{:keys [title sid parent turns] c-cwd :cwd} (cs i)
+        subs-of (fn [k] (for [[ci c] (map-indexed vector cs)
+                              :when (and (= i (:parent c)) (= k (:from c)) (names ci))]
+                          (str "→ Subchat: [" (:title c) "](" (names ci) ")")))]
+    (str (str/join "\n\n"
+                   (concat [(str "# " title)
+                            (str "- Folder: `" (or c-cwd @cwd) "`\n- Session: `" sid "`"
+                                 (when (and parent (names parent))
+                                   (str "\n- Subchat of: [" (:title (cs parent)) "](" (names parent) ")")))]
+                           (mapcat (fn [k t] (cons (turn->md t) (subs-of k))) (range) turns)))
+         ;; JSON escapes no "-", so spell "--" inside strings as escapes to keep the comment closed
+         "\n\n<!-- muse-chat " (str/replace (acp/write-json (chat->data cs i)) "--" "\\u002d\\u002d") " -->\n")))
+
+(defn md->chat
+  "The chat saved in a file written by chat->md, or nil."
+  [text]
+  (when-let [[_ json] (re-find #"<!-- muse-chat (.*) -->" text)]
+    (-> (acp/read-json json)
+        (update :turns (fn [ts] (mapv (fn [t] (cond-> (update t :role keyword)
+                                                (:items t) (update :items (fn [its] (mapv #(update % :type keyword) its)))))
+                                      ts))))))
+
+(defn load-chats
+  "Every chat saved in chats-dir, oldest first, marked :restored so its
+  session is reopened when it is next used. Unreadable files are skipped."
+  []
+  (let [loaded (->> (.listFiles (io/file chats-dir))
+                    (filter #(str/ends-with? (.getName %) ".md"))
+                    (keep (fn [f] (try (some-> (md->chat (slurp f)) (assoc :file (.getName f)))
+                                       (catch Exception _ nil))))
+                    (filter :sid)
+                    (sort-by #(or (:created %) 0))
+                    vec)
+        idx (into {} (map-indexed (fn [i c] [(:sid c) i]) loaded))]
+    (mapv (fn [c] (-> c
+                      (assoc :restored true :plan [])
+                      (assoc :parent (idx (:parentSid c)))
+                      (dissoc :parentSid)))
+          loaded)))
+
+(defn save-all!
+  "Writes every chat that has turns to chats-dir; a renamed chat's old file
+  goes. Runs on the ACP reader thread after each answer."
+  []
+  (try
+    (let [cs @chats
+          names (mapv #(when (and (:sid %) (seq (:turns %))) (file-name %)) cs)]
+      (io/make-parents (io/file chats-dir "x"))
+      (doseq [[i c] (map-indexed vector cs) :when (names i)]
+        (spit (io/file chats-dir (names i)) (chat->md cs names i))
+        (when (and (:file c) (not= (:file c) (names i)))
+          (io/delete-file (io/file chats-dir (:file c)) true))
+        (swap! chats assoc-in [i :file] (names i))))
+    (reset! save-error nil)
+    (catch Exception e (reset! save-error (ex-message e)))))
 
 (defn send-prompt!
   ([text] (send-prompt! @current text))
   ([i text]
-   (let [{:keys [sid busy]} (get @chats i)]
-     (when (and sid (not busy) (not (str/blank? text)))
-       (update-chat! sid #(-> %
-                              (assoc :busy true)
-                              (update :turns conj {:role :user :text text}
-                                      {:role :agent :thought "" :items [] :t0 (now)})))
-       (acp/request! @conn "session/prompt" {:sessionId sid :prompt [{:type "text" :text text}]}
-                     (fn [r e]
-                       (update-turn! sid #(cond-> (assoc % :done true :t1 (now))
-                                            e (add-item {:type :error :text (:message e)})
-                                            (= "cancelled" (:stopReason r)) (add-item {:type :note :text "Stopped"})))
-                       (update-chat! sid assoc :busy false)))))))
+   (when-not (str/blank? text)
+     (ensure-live! i #(send-prompt* i text)))))
+
+(defn- send-prompt* [i text]
+  (let [{:keys [sid busy]} (get @chats i)]
+    (when (and sid (not busy) (not (str/blank? text)))
+      (update-chat! sid #(-> %
+                             (assoc :busy true)
+                             (update :turns conj {:role :user :text text}
+                                     {:role :agent :thought "" :items [] :t0 (now)})))
+      (acp/request! @conn "session/prompt" {:sessionId sid :prompt [{:type "text" :text text}]}
+                    (fn [r e]
+                      (update-turn! sid #(cond-> (assoc % :done true :t1 (now))
+                                           e (add-item {:type :error :text (:message e)})
+                                           (= "cancelled" (:stopReason r)) (add-item {:type :note :text "Stopped"})))
+                      (update-chat! sid assoc :busy false)
+                      (save-all!))))))
 
 (defn cancel! []
   (when-let [sid (:sid (get @chats @current))]
     (acp/notify! @conn "session/cancel" {:sessionId sid})
-    (doseq [p @perms :when (= sid (:sid p))] (answer-permission! {:outcome "cancelled"}))))
+    (doseq [p @perms :when (= sid (:sid p))] (answer-permission! p {:outcome "cancelled"}))))
 
 (defn start! []
   (let [c (acp/connect agent-cmd {:notify (fn [m p] (when (= m "session/update") (on-update p)))
@@ -221,7 +340,9 @@
                   (fn [_ e]
                     (if e
                       (reset! status (str "Claude did not start: " (:message e)))
-                      (do (reset! status nil) (new-chat!)))))))
+                      (do (reset! chats (load-chats))
+                          (reset! status nil)
+                          (new-chat!)))))))
 
 ;; ---- UI
 
@@ -372,6 +493,10 @@
                        {:title "Plan"})
         (ui/text u "Claude shows its plan here when a task has several steps."
                  {:size 13 :color :text-muted}))
+      (ui/label u "Saved chats")
+      (ui/row u {:gap 10 :align :center :width :fill :pad 8 :radius 12 :bg :surface-muted}
+        (ui/icon u (if @save-error :circle-alert :file-text) 16 :text-secondary)
+        (ui/text u (or @save-error chats-dir) {:size 13 :width :fill :nowrap true}))
       (ui/label u "Session")
       (ui/text u (str (count tools) (if (= 1 (count tools)) " tool call" " tool calls")) {:size 13 :color :text-secondary})
       (when-let [c (:cost usage)]
