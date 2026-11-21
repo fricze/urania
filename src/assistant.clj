@@ -19,6 +19,8 @@
 (def chats (atom []))    ; [{:sid :title :turns [..] :busy :plan [..] :usage {..}}]
 (def current (atom 0))
 (def draft (atom ""))
+(def attached (atom []))  ; image paths waiting to go with the next message
+(def textures (atom {}))  ; path -> {:tex :w :h}, or :failed
 (def models (atom []))   ; the agent's "model" config options
 (def model (atom 0))
 (def perms (atom []))    ; queued session/request_permission requests
@@ -33,6 +35,11 @@
 (def branch-ask (atom ""))
 (def chats-dir (str (System/getProperty "user.home") "/Muse"))
 (def save-error (atom nil))
+(def prompts (atom []))     ; saved prompts [{:title :text}], kept in chats-dir/prompts.json
+(def prompts-open (atom false))
+(def prompt-sel (atom 0))   ; the prompt being edited
+(def prompt-title (atom ""))
+(def prompt-text (atom ""))
 
 (defn now [] (System/currentTimeMillis))
 
@@ -216,6 +223,18 @@
 
 ;; ---- saving chats as markdown, one file per chat in chats-dir
 
+(def image-types {"png" "image/png" "jpg" "image/jpeg" "jpeg" "image/jpeg" "gif" "image/gif" "webp" "image/webp"})
+
+(defn image-type [path] (image-types (str/lower-case (or (second (re-find #"\.([^./]+)$" path)) ""))))
+
+(defn image-block [path]
+  {:type "image" :mimeType (image-type path)
+   :data (.encodeToString (java.util.Base64/getEncoder)
+                          (java.nio.file.Files/readAllBytes (.toPath (io/file path))))})
+
+(defn attach! [paths]
+  (swap! attached #(into % (comp (filter image-type) (remove (set %))) paths)))
+
 (defn file-name [{:keys [title sid]}]
   (let [s (str/replace (str/lower-case (or title "chat")) #"[^\p{L}\p{N}]+" "-")
         s (str/replace (subs s 0 (min 60 (count s))) #"^-+|-+$" "")]
@@ -223,7 +242,7 @@
 
 (defn turn->md [t]
   (if (= :user (:role t))
-    (str "## You\n\n" (:text t))
+    (str "## You\n\n" (str/join "\n\n" (concat (for [p (:images t)] (str "![](<" p ">)")) [(:text t)])))
     (str/join "\n\n"
               (concat ["## Claude"]
                       (when (seq (:thought t))
@@ -303,20 +322,55 @@
     (reset! save-error nil)
     (catch Exception e (reset! save-error (ex-message e)))))
 
+(def default-prompts
+  [{:title "Explain" :text "Explain how this works, step by step:"}
+   {:title "Review" :text "Review the current changes for bugs and risky edge cases."}
+   {:title "Summarize" :text "Summarize this in five bullet points."}
+   {:title "Tests" :text "Write tests for this and run them."}])
+
+(defn prompts-file [] (io/file chats-dir "prompts.json"))
+
+(defn load-prompts
+  "The saved prompts, or the defaults when there is no file yet."
+  []
+  (let [f (prompts-file)]
+    (if (.exists f)
+      (try (vec (acp/read-json (slurp f))) (catch Exception _ default-prompts))
+      default-prompts)))
+
+(defn save-prompts! []
+  (try (io/make-parents (prompts-file))
+       (spit (prompts-file) (acp/write-json @prompts))
+       (catch Exception e (reset! save-error (ex-message e)))))
+
+(defn use-prompt!
+  "Puts a saved prompt into the message box, after anything typed so far."
+  [{:keys [text]}]
+  (swap! draft #(if (str/blank? %) text (str (str/trimr %) "\n\n" text))))
+
+(defn edit-prompt! [i]
+  (reset! prompt-sel i)
+  (reset! prompt-title (:title (get @prompts i) ""))
+  (reset! prompt-text (:text (get @prompts i) "")))
+
 (defn send-prompt!
   ([text] (send-prompt! @current text))
-  ([i text]
-   (when-not (str/blank? text)
-     (ensure-live! i #(send-prompt* i text)))))
+  ([i text] (send-prompt! i text nil))
+  ([i text images]
+   (when-not (and (str/blank? text) (empty? images))
+     (ensure-live! i #(send-prompt* i text images)))))
 
-(defn- send-prompt* [i text]
-  (let [{:keys [sid busy]} (get @chats i)]
-    (when (and sid (not busy) (not (str/blank? text)))
+(defn- send-prompt* [i text images]
+  (let [{:keys [sid busy]} (get @chats i)
+        blocks (try (cond-> (mapv image-block images)
+                      (not (str/blank? text)) (conj {:type "text" :text text}))
+                    (catch Exception e (reset! save-error (str "Could not read image: " (ex-message e))) nil))]
+    (when (and sid (not busy) (seq blocks))
       (update-chat! sid #(-> %
                              (assoc :busy true)
-                             (update :turns conj {:role :user :text text}
+                             (update :turns conj (cond-> {:role :user :text text} (seq images) (assoc :images (vec images)))
                                      {:role :agent :thought "" :items [] :t0 (now)})))
-      (acp/request! @conn "session/prompt" {:sessionId sid :prompt [{:type "text" :text text}]}
+      (acp/request! @conn "session/prompt" {:sessionId sid :prompt blocks}
                     (fn [r e]
                       (update-turn! sid #(cond-> (assoc % :done true :t1 (now))
                                            e (add-item {:type :error :text (:message e)})
@@ -435,6 +489,75 @@
     (let [pick (ui/prompt-suggestions u "sugg" suggestions {:columns (if @narrow 1 2)})]
       (when (>= pick 0) (send-prompt! (:title (suggestions pick)))))))
 
+(defn texture [u path]
+  (or (@textures path)
+      (let [w (atom 0) h (atom 0)
+            tex (try (ui/image-load u path w h) (catch Exception _ 0))
+            t (if (and tex (pos? tex)) {:tex tex :w @w :h @h} :failed)]
+        (swap! textures assoc path t)
+        t)))
+
+(defn user-images
+  "Thumbnails of a message's images, right-aligned like the message."
+  [u paths]
+  (ui/row u {:width :fill :justify :end :gap 8 :wrap true}
+    (doseq [p paths]
+      (let [t (texture u p)]
+        (if (= :failed t)
+          (ui/text u (str "Missing image: " (.getName (io/file p))) {:size 12 :color :text-muted})
+          (let [s (min 1.0 (/ 240.0 (max 1 (:w t))) (/ 240.0 (max 1 (:h t))))]
+            (ui/image u (:tex t) {:width (* s (:w t)) :height (* s (:h t)) :radius 10})))))))
+
+(defn prompt-bar
+  "One-click saved prompts above the message box."
+  [u]
+  (ui/row u {:width :fill :gap 6 :wrap true :align :center}
+    (doseq [[i pr] (map-indexed vector @prompts)]
+      (ui/push-id-int u i)
+      (when (ui/button u (:title pr) {:variant :outline :size :sm :tooltip (:text pr)})
+        (use-prompt! pr))
+      (ui/pop-id u))
+    (when (ui/button u (if (seq @prompts) "" "Saved prompts") {:variant :ghost :size :sm :icon :square-pen :tooltip "Edit saved prompts"})
+      (edit-prompt! 0)
+      (reset! prompts-open true))))
+
+(defn prompts-dialog [u]
+  (ui/dialog u "Saved prompts" prompts-open
+             {:description "Click a prompt above the message box to put it in your message." :width 720}
+    (let [ps @prompts
+          i @prompt-sel]
+      (ui/row u {:width :fill :gap 16 :align :stretch}
+        (ui/scroll u {:id "prompt-list" :width 200 :height 300 :gap 4}
+          (doseq [[j pr] (map-indexed vector ps)]
+            (ui/push-id-int u j)
+            (when (ui/button u (if (str/blank? (:title pr)) "Untitled" (:title pr))
+                             {:variant :ghost :selected (= i j) :width :fill})
+              (edit-prompt! j))
+            (ui/pop-id u)))
+        (ui/column u {:width :fill :gap 10}
+          (if (< i (count ps))
+            (do
+              (ui/input u "ptitle" prompt-title {:label "Name" :width :fill})
+              (ui/textarea u "ptext" prompt-text {:label "Prompt" :height 200 :width :fill})
+              ;; read the selection again: a click in the list above may have
+              ;; just switched it, and the fields now hold the new prompt
+              (let [j @prompt-sel
+                    edited {:title @prompt-title :text @prompt-text}]
+                (when (and (< j (count @prompts)) (not= edited (get @prompts j)))
+                  (swap! prompts assoc j edited)
+                  (save-prompts!)))
+              (when (ui/button u "Delete" {:variant :danger :size :sm :icon :trash-2})
+                (swap! prompts #(into (subvec % 0 i) (subvec % (inc i))))
+                (save-prompts!)
+                (edit-prompt! (max 0 (dec i)))))
+            (ui/text u "No saved prompts yet." {:color :text-muted})))))
+    (ui/dialog-footer u
+      (when (ui/button u "New prompt" {:variant :outline :icon :plus})
+        (swap! prompts conj {:title "New prompt" :text ""})
+        (save-prompts!)
+        (edit-prompt! (dec (count @prompts))))
+      (when (ui/button u "Done" {:variant :primary}) (reset! prompts-open false)))))
+
 (defn conversation [u]
   (let [n? @narrow
         {:keys [sid turns busy usage parent]} (get @chats @current)]
@@ -466,13 +589,25 @@
                 (when (ui/link u (:title (get @chats parent))) (reset! current parent))))
             (doseq [[k t] (map-indexed vector turns)]
               (if (= :user (:role t))
-                (ui/chat-message u (:text t) {:mine true :markdown true})
+                (do (when (seq (:images t)) (user-images u (:images t)))
+                    (when-not (str/blank? (:text t)) (ui/chat-message u (:text t) {:mine true :markdown true})))
                 (agent-turn u @current k t (:text (get turns (dec k))) busy))))))
       (ui/row u {:width :fill :justify :center :pad-x (if n? 12 24) :pad-bottom (if n? 12 20)}
         (ui/column u {:width :fill :max-width 760 :gap 8}
-          (let [ev (ui/chat-composer u "composer" draft {:placeholder "Ask Claude" :busy (boolean busy)})]
+          (prompt-bar u)
+          (let [removed (atom -1)
+                ev (ui/chat-composer u "composer" draft {:placeholder "Ask Claude" :busy (boolean busy)
+                                                         :attachments (mapv #(.getName (io/file %)) @attached)
+                                                         :removed removed})]
             (when (and (pos? (bit-and ev raw/CUI_COMPOSER_SEND)) sid (not busy))
-              (send-prompt! @draft) (reset! draft ""))
+              (send-prompt! @current @draft @attached) (reset! draft "") (reset! attached []))
+            (when (pos? (bit-and ev raw/CUI_COMPOSER_ATTACH))
+              (let [out (atom "")]
+                (when (ui/app-file-dialog (ui/current-app) {:kind :open :title "Attach image" :filter-name "Images"
+                                                            :filter (str/join ";" (keys image-types))} out)
+                  (attach! [@out]))))
+            (when (and (pos? (bit-and ev raw/CUI_COMPOSER_REMOVE)) (>= @removed 0))
+              (swap! attached #(into (subvec % 0 @removed) (subvec % (inc @removed)))))
             (when (pos? (bit-and ev raw/CUI_COMPOSER_STOP)) (cancel!)))
           (ui/text u "Claude can read and change files in the working directory."
                    {:size 12 :color :text-muted :align :center :width :fill}))))))
@@ -544,6 +679,7 @@
     (when (and @conn (acp/busy? @conn))
       ;; agent updates arrive on another thread; poll while a request is open
       (ui/request-wakeup u 0.05))
+    (attach! (map #(ui/dropped-file u %) (range (ui/dropped-file-count u))))
     (reset! narrow (< vw 760))
     (when-not @narrow (reset! drawer false))
     (ui/row u {:width :fill :height :fill :align :stretch :bg :background}
@@ -553,10 +689,12 @@
     (ui/sheet u "Muse" drawer {:side :left :size 300}
       (sidebar u true))
     (branch-dialog u)
+    (prompts-dialog u)
     (permission-dialog u)))
 
 (defn -main [& [dir]]
   (when dir (reset! cwd dir))
+  (reset! prompts (load-prompts))
   (start!)
   (try
     (ui/run {:title "Muse" :width 1440 :height 900 :theme :dark :accent :neutral} frame)
