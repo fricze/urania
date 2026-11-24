@@ -63,14 +63,14 @@
     (a/save-prompts!)
     (assert (= @a/prompts (a/load-prompts))))
   ;; picking another prompt in the editor must not copy it over the previous one
-  (let [real-button ui/button
+  (let [real-item ui/nav-item
         click (atom nil)
         u (ui/create {:theme :dark})]
     (ui/set-viewport u 1000 700 1)
     (with-redefs [a/prompts (atom a/default-prompts)
                   a/prompts-open (atom true)
                   a/save-prompts! (fn [])
-                  ui/button (fn [u label & [opts]] (or (= label @click) (real-button u label opts)))]
+                  ui/nav-item (fn [u label & [opts]] (or (= label @click) (real-item u label opts)))]
       (a/edit-prompt! 1)
       (doseq [pick [nil "Tests" nil "Explain" nil]]
         (reset! click pick)

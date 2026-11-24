@@ -4,7 +4,7 @@
   answers into CUI's chat components. Each chat is an ACP session working in
   the given directory. The workspace panel closes below 1180 points and the
   chat list becomes a drawer below 760.
-  Run: jolt -A:examples -m assistant [working-dir]"
+  Run: jolt run -m assistant [working-dir]"
   (:require [acp]
             [cui.core :as ui]
             [cui.raw :as raw]
@@ -530,8 +530,8 @@
         (ui/scroll u {:id "prompt-list" :width 200 :height 300 :gap 4}
           (doseq [[j pr] (map-indexed vector ps)]
             (ui/push-id-int u j)
-            (when (ui/button u (if (str/blank? (:title pr)) "Untitled" (:title pr))
-                             {:variant :ghost :selected (= i j) :width :fill})
+            (when (ui/nav-item u (if (str/blank? (:title pr)) "Untitled" (:title pr))
+                               {:selected (= i j) :group "prompts"})
               (edit-prompt! j))
             (ui/pop-id u)))
         (ui/column u {:width :fill :gap 10}

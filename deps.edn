@@ -1,0 +1,12 @@
+{:paths ["src"]
+
+ ;; cui-jolt is expected next to this repo, with libcui built (`jolt native` there)
+ :deps {io.github.jlt-commons/cui-jolt {:local/root "../cui-jolt"}}
+
+ :aliases {:test {:extra-paths ["test"]}}
+
+ :tasks
+ {start {:doc "Start Muse; an optional argument is the working directory"
+         :task (apply shell "jolt" "run" "-m" "assistant" *command-line-args*)}
+  test  {:doc "Run the tests (no agent or display needed)"
+         :task (shell "jolt" "-A:test" "-m" "assistant-test")}}}
