@@ -1,11 +1,14 @@
 (ns assistant
   "A chat app that talks to Claude through the Agent Client Protocol: it starts
   `claude-agent-acp` (via npx) and streams reasoning, tool calls, plans and
-  answers into CUI's chat components. Each chat is an ACP session working in
-  the given directory. The workspace panel closes below 1180 points and the
-  chat list becomes a drawer below 760.
+  answers into CUI's chat components, written as glimmer components. Each chat
+  is an ACP session working in the given directory. The workspace panel closes
+  below 1180 points and the chat list becomes a drawer below 760.
   Run: jolt run -m assistant [working-dir]"
   (:require [acp]
+            [glimmer.ratom :as r]
+            [glimmer.core :as g]
+            [glimmer-cui.core :as gc]
             [cui.core :as ui]
             [cui.raw :as raw]
             [clojure.java.io :as io]
@@ -13,35 +16,42 @@
 
 (def agent-cmd ["npx" "-y" "@agentclientprotocol/claude-agent-acp"])
 
+;; Ratoms are what the components read; a change re-renders only the
+;; components that read it. The ACP reader thread writes them too: glimmer
+;; queues those re-renders onto the window loop and wakes it.
 (def conn (atom nil))
-(def status (atom "Starting Claude…"))  ; nil once the agent is ready
-(def cwd (atom (System/getProperty "user.dir")))
-(def chats (atom []))    ; [{:sid :title :turns [..] :busy :plan [..] :usage {..}}]
-(def current (atom 0))
-(def draft (atom ""))
-(def attached (atom []))  ; image paths waiting to go with the next message
-(def textures (atom {}))  ; path -> {:tex :w :h}, or :failed
-(def models (atom []))   ; the agent's "model" config options
-(def model (atom 0))
-(def perms (atom []))    ; queued session/request_permission requests
-(def perm-open (atom false))
-(def version (atom 0))   ; bumps on every agent update, drives autoscroll
-(def seen (atom -1))
-(def narrow (atom false))
-(def drawer (atom false))
-(def branch (atom nil))  ; the reply being split: {:chat :turn :blocks [..] :picked #{..}}
-(def branch-open (atom false))
-(def branch-quote (atom ""))
-(def branch-ask (atom ""))
+(def status (r/atom "Starting Claude…"))  ; nil once the agent is ready
+(def cwd (r/atom (System/getProperty "user.dir")))
+(def chats (r/atom []))    ; [{:sid :title :turns [..] :busy :plan [..] :usage {..}}]
+(def current (r/atom 0))
+(def draft (atom ""))      ; the message box's text; it is an immediate-mode island
+(def attached (r/atom []))  ; image paths waiting to go with the next message
+(def textures (atom {}))   ; path -> {:tex :w :h}, or :failed
+(def models (r/atom []))   ; the agent's "model" config options
+(def model (r/atom 0))
+(def perms (r/atom []))    ; queued session/request_permission requests
+(def perm-open (r/atom false))
+(def narrow (r/atom false))
+(def wide (r/atom true))
+(def drawer (r/atom false))
+(def clock (r/atom 0))     ; ticks while a chat is busy, so timers move
+(def branch (r/atom nil))  ; the reply being split: {:chat :turn :blocks [..] :picked #{..}}
+(def branch-open (r/atom false))
+(def branch-quote (r/atom ""))
+(def branch-ask (r/atom ""))
 (def chats-dir (str (System/getProperty "user.home") "/Muse"))
-(def save-error (atom nil))
-(def prompts (atom []))     ; saved prompts [{:title :text}], kept in chats-dir/prompts.json
-(def prompts-open (atom false))
-(def prompt-sel (atom 0))   ; the prompt being edited
-(def prompt-title (atom ""))
-(def prompt-text (atom ""))
+(def save-error (r/atom nil))
+(def prompts (r/atom []))     ; saved prompts [{:title :text}], kept in chats-dir/prompts.json
+(def prompts-open (r/atom false))
+(def prompt-sel (r/atom 0))   ; the prompt being edited
 
 (defn now [] (System/currentTimeMillis))
+
+(defn follow!
+  "Scrolls the conversation to its end on the next frame.
+  ponytail: follows every update, even if you scrolled up mid-answer."
+  []
+  (gc/with-ui #(ui/scroll-to % "chat" 1e9)))
 
 ;; ---- chat state, updated from the ACP reader thread
 
@@ -51,7 +61,7 @@
   ;; ponytail: chats are only ever appended, so an index stays valid
   (when-let [i (chat-idx sid)]
     (swap! chats #(apply update % i f args))
-    (swap! version inc)))
+    (follow!)))
 
 (defn update-turn!
   "Applies f to the chat's last turn when it is the agent's."
@@ -160,7 +170,7 @@
                         (when (and opt (not= (:value (get @models @model)) (:currentValue opt)))
                           (set-model! sid))
                         (when on-ready (on-ready i))))
-                    (swap! version inc)))))
+                    (follow!)))))
 
 (defn new-chat! [] (open-session! {} "session/new" {} nil))
 
@@ -348,10 +358,12 @@
   [{:keys [text]}]
   (swap! draft #(if (str/blank? %) text (str (str/trimr %) "\n\n" text))))
 
-(defn edit-prompt! [i]
-  (reset! prompt-sel i)
-  (reset! prompt-title (:title (get @prompts i) ""))
-  (reset! prompt-text (:text (get @prompts i) "")))
+(defn edit-prompt! [i] (reset! prompt-sel i))
+
+(defn update-prompt! [i k v]
+  (when (and (< i (count @prompts)) (not= v (get-in @prompts [i k])))
+    (swap! prompts assoc-in [i k] v)
+    (save-prompts!)))
 
 (defn send-prompt!
   ([text] (send-prompt! @current text))
@@ -400,32 +412,38 @@
 
 ;; ---- UI
 
-(defn sidebar [u drawer?]
-  (ui/column u {:width (if drawer? :fill 264) :height :fill :bg (when-not drawer? :surface-muted)
-                :pad (if drawer? 0 12) :gap 2}
-    (ui/row u {:gap 10 :pad-x 6 :pad-top 4 :pad-bottom 10 :align :center}
-      (ui/box u {:width 28 :height 28 :radius 9 :bg :accent :dir :stack :align :center :justify :center}
-        (ui/text u "M" {:font :display :size 16 :color :accent-foreground :line-height 1.0}))
-      (ui/text u "Muse" {:font :medium :size 15 :width :fill :nowrap true})
-      (when (and (ui/icon-button u :square-pen {:size :sm :tooltip "New chat"}) (nil? @status))
-        (new-chat!) (reset! drawer false)))
-    (ui/nav-section u "Chats")
-    ;; newest first, each subchat indented under the chat it came from
-    (let [kids (group-by :parent (map-indexed #(assoc %2 :i %1) @chats))]
-      ((fn walk [parent depth]
-         (doseq [{:keys [i title busy]} (reverse (kids parent))]
-           (ui/push-id-int u i)
-           (ui/box u {:width :fill :pad-left (* 16 depth)}
-             (when (ui/nav-item u title {:icon (if parent :git-branch :message-square) :selected (= @current i)
-                                         :group "chats" :badge (when busy "…")})
-               (reset! current i) (reset! drawer false)))
-           (ui/pop-id u)
-           (walk i (inc depth))))
-       nil 0))
-    (ui/spacer u)
-    (ui/row u {:gap 8 :align :center :pad-x 6}
-      (ui/icon u (if @status :circle-alert :sparkles) 14 (if @status :text-muted :accent))
-      (ui/text u (or @status "Claude via ACP") {:size 12 :color :text-secondary :width :fill}))))
+;; ---- UI: glimmer components. A component re-renders when a ratom it read
+;; changes; CUI-only bits (image textures, drops, the message box) are
+;; immediate-mode islands that run every frame.
+
+(defn sidebar [drawer?]
+  (let [st @status
+        cur @current
+        kids (group-by :parent (map-indexed #(assoc %2 :i %1) @chats))
+        ;; newest first, each subchat indented under the chat it came from
+        rows ((fn walk [parent depth]
+                (mapcat (fn [{:keys [i]}] (cons [i depth] (walk i (inc depth))))
+                        (reverse (kids parent))))
+              nil 0)]
+    [:column {:width (if drawer? :fill 264) :height :fill :bg (when-not drawer? :surface-muted)
+              :pad (if drawer? 0 12) :gap 2}
+     [:row {:gap 10 :pad-x 6 :pad-top 4 :pad-bottom 10 :align :center}
+      [:box {:width 28 :height 28 :radius 9 :bg :accent :dir :stack :align :center :justify :center}
+       [:text {:text "M" :font :display :size 16 :color :accent-foreground :line-height 1.0}]]
+      [:text {:text "Muse" :font :medium :size 15 :width :fill :nowrap true}]
+      [:icon-button {:icon :square-pen :size :sm :tooltip "New chat"
+                     :on-click #(when (nil? @status) (new-chat!) (reset! drawer false))}]]
+     [:nav-section {:title "Chats"}]
+     (for [[i depth] rows
+           :let [{:keys [title busy parent]} (get @chats i)]]
+       [:box {:key i :width :fill :pad-left (* 16 depth)}
+        [:nav-item {:label title :icon (if parent :git-branch :message-square) :selected (= cur i)
+                    :group "chats" :badge (when busy "…")
+                    :on-click #(do (reset! current i) (reset! drawer false))}]])
+     [:spacer]
+     [:row {:gap 8 :align :center :pad-x 6}
+      [:icon {:icon (if st :circle-alert :sparkles) :size 14 :color (if st :text-muted :accent)}]
+      [:text {:text (or st "Claude via ACP") :size 12 :color :text-secondary :width :fill}]]]))
 
 (defn secs [t0 t1] (/ (- (or t1 (now)) t0) 1000.0))
 
@@ -440,54 +458,50 @@
   (reset! branch-ask "")
   (reset! branch-open true))
 
-(defn agent-turn [u i k {:keys [thought items done t0 thought-end]} prompt chat-busy]
-  (ui/id-scope u (str "turn" k)
-    (when (seq thought)
-      (ui/reasoning u "think" {:thinking (and (not done) (nil? thought-end))
-                               :seconds (secs t0 thought-end)}
-        (ui/text u thought {:size 13.5 :color :text-secondary})))
-    (doseq [[j it] (map-indexed vector items)]
-      (ui/push-id-int u j)
-      (case (:type it)
-        :text (ui/markdown u "md" (:text it) {:width :fill :size 15 :streaming (not done)})
-        :tool (let [st (tool-status (:status it) :pending)]
-                (ui/tool-call u "tool" (or (:title it) "Tool")
-                              {:icon (tool-icons (:kind it) :code) :detail (:kind it) :status st
-                               :seconds (secs (:t0 it) (or (:t1 it) (when done (now))))
-                               :input (:input it) :output (:output it)}))
-        :error (ui/alert u (:text it) {:tone :danger})
-        :note (ui/text u (:text it) {:size 12 :color :text-muted}))
-      (ui/pop-id u))
-    (when (and (not done) (empty? items) (empty? thought))
-      (ui/agent-status u "Thinking" {:status :running :seconds (secs t0 nil)}))
-    (when done
-      (let [text (str/join "\n\n" (keep :text (filter #(= :text (:type %)) items)))
-            subs* (keep-indexed (fn [ci c] (when (and (= i (:parent c)) (= k (:from c))) [ci c])) @chats)]
-        (ui/row u {:gap 4 :align :center :wrap true}
-          (let [act (ui/response-actions u "actions" {:copy-text text :no-share true})]
-            (when (pos? (bit-and act raw/CUI_RESPONSE_REGENERATE)) (send-prompt! prompt)))
-          (when (and (seq text)
-                     (ui/button u "Subchat" {:icon :git-branch :variant :ghost :size :sm :disabled (boolean chat-busy)
-                                             :tooltip "Ask about part of this reply in a new chat"}))
-            (open-branch! i k text)))
-        (doseq [[ci c] subs*]
-          (ui/push-id-int u ci)
-          (ui/row u {:gap 6 :align :center}
-            (ui/icon u :git-branch 14 :text-muted)
-            (when (ui/link u (:title c)) (reset! current ci)))
-          (ui/pop-id u))))))
+(defn agent-turn [i k {:keys [thought items done t0 thought-end]} prompt chat-busy]
+  (when-not done @clock)                ; running timers tick with the clock
+  (let [text (str/join "\n\n" (keep :text (filter #(= :text (:type %)) items)))]
+    [:column {:width :fill :gap 14}
+     (when (seq thought)
+       [:reasoning {:id (str "think-" i "-" k) :thinking (and (not done) (nil? thought-end)) :seconds (secs t0 thought-end)}
+        [:text {:text thought :size 13.5 :color :text-secondary}]])
+     (for [[j it] (map-indexed vector items)]
+       (case (:type it)
+         :text [:markdown {:key j :id (str "md-" i "-" k "-" j) :text (:text it) :width :fill :size 15 :streaming (not done)}]
+         :tool [:tool-call {:key j :id (str "tool-" i "-" k "-" j) :name (or (:title it) "Tool")
+                            :icon (tool-icons (:kind it) :code) :detail (:kind it)
+                            :status (tool-status (:status it) :pending)
+                            :seconds (secs (:t0 it) (or (:t1 it) (when done (now))))
+                            :input (:input it) :output (:output it)}]
+         :error [:alert {:key j :title (:text it) :tone :danger}]
+         :note [:text {:key j :text (:text it) :size 12 :color :text-muted}]))
+     (when (and (not done) (empty? items) (empty? thought))
+       [:agent-status {:text "Thinking" :status :running :seconds (secs t0 nil)}])
+     (when done
+       [:row {:gap 4 :align :center :wrap true}
+        [:response-actions {:id (str "actions-" i "-" k) :copy-text text :no-share true
+                            :on-result #(when (pos? (bit-and % raw/CUI_RESPONSE_REGENERATE)) (send-prompt! prompt))}]
+        (when (seq text)
+          [:button {:label "Subchat" :icon :git-branch :variant :ghost :size :sm :disabled (boolean chat-busy)
+                    :tooltip "Ask about part of this reply in a new chat"
+                    :on-click #(open-branch! i k text)}])])
+     (when done
+       (for [[ci c] (keep-indexed (fn [ci c] (when (and (= i (:parent c)) (= k (:from c))) [ci c])) @chats)]
+         [:row {:key ci :gap 6 :align :center}
+          [:icon {:icon :git-branch :size 14 :color :text-muted}]
+          [:link {:text (:title c) :on-click #(reset! current ci)}]]))]))
 
 (def suggestions [{:icon :search :title "Explain this project" :detail "Read the README and the code layout"}
                   {:icon :code :title "Find a bug" :detail "Look for something that could break"}
                   {:icon :file-text :title "Summarize the recent commits"}
                   {:icon :sparkles :title "Suggest an improvement"}])
 
-(defn empty-state [u]
-  (ui/column u {:width :fill :gap 16 :pad-top 80 :align :center}
-    (ui/text u "What can I help with?" {:font :display :size 26})
-    (ui/text u @cwd {:size 13 :color :text-muted})
-    (let [pick (ui/prompt-suggestions u "sugg" suggestions {:columns (if @narrow 1 2)})]
-      (when (>= pick 0) (send-prompt! (:title (suggestions pick)))))))
+(defn empty-state []
+  [:column {:width :fill :gap 16 :pad-top 80 :align :center}
+   [:text {:text "What can I help with?" :font :display :size 26}]
+   [:text {:text @cwd :size 13 :color :text-muted}]
+   [:prompt-suggestions {:id "sugg" :items suggestions :columns (if @narrow 1 2)
+                         :on-result #(when (>= % 0) (send-prompt! (:title (suggestions %))))}]])
 
 (defn texture [u path]
   (or (@textures path)
@@ -498,204 +512,240 @@
         t)))
 
 (defn user-images
-  "Thumbnails of a message's images, right-aligned like the message."
-  [u paths]
-  (ui/row u {:width :fill :justify :end :gap 8 :wrap true}
-    (doseq [p paths]
-      (let [t (texture u p)]
-        (if (= :failed t)
-          (ui/text u (str "Missing image: " (.getName (io/file p))) {:size 12 :color :text-muted})
-          (let [s (min 1.0 (/ 240.0 (max 1 (:w t))) (/ 240.0 (max 1 (:h t))))]
-            (ui/image u (:tex t) {:width (* s (:w t)) :height (* s (:h t)) :radius 10})))))))
+  "Thumbnails of a message's images, right-aligned like the message. Textures
+  need the ui handle, so this is an immediate-mode island."
+  [paths]
+  [:cui/immediate
+   {:render (fn [u]
+              (ui/row u {:width :fill :justify :end :gap 8 :wrap true}
+                (doseq [p paths]
+                  (let [t (texture u p)]
+                    (if (= :failed t)
+                      (ui/text u (str "Missing image: " (.getName (io/file p))) {:size 12 :color :text-muted})
+                      (let [s (min 1.0 (/ 240.0 (max 1 (:w t))) (/ 240.0 (max 1 (:h t))))]
+                        (ui/image u (:tex t) {:width (* s (:w t)) :height (* s (:h t)) :radius 10})))))))}])
 
 (defn prompt-bar
   "One-click saved prompts above the message box."
+  []
+  (let [ps @prompts]
+    [:row {:width :fill :gap 6 :wrap true :align :center}
+     (for [[i pr] (map-indexed vector ps)]
+       [:button {:key i :label (:title pr) :variant :outline :size :sm :tooltip (:text pr)
+                 :on-click #(use-prompt! pr)}])
+     [:button {:label (if (seq ps) "" "Saved prompts") :variant :ghost :size :sm :icon :square-pen
+               :tooltip "Edit saved prompts"
+               :on-click #(do (edit-prompt! 0) (reset! prompts-open true))}]]))
+
+(defn composer-frame
+  "The message box: CUI's chat composer, drawn immediate-mode every frame,
+  since its text, attachment removal and send flags are one-frame results."
   [u]
-  (ui/row u {:width :fill :gap 6 :wrap true :align :center}
-    (doseq [[i pr] (map-indexed vector @prompts)]
-      (ui/push-id-int u i)
-      (when (ui/button u (:title pr) {:variant :outline :size :sm :tooltip (:text pr)})
-        (use-prompt! pr))
-      (ui/pop-id u))
-    (when (ui/button u (if (seq @prompts) "" "Saved prompts") {:variant :ghost :size :sm :icon :square-pen :tooltip "Edit saved prompts"})
-      (edit-prompt! 0)
-      (reset! prompts-open true))))
+  (let [{:keys [sid busy]} (get @chats @current)
+        removed (atom -1)
+        ev (ui/chat-composer u "composer" draft {:placeholder "Ask Claude" :busy (boolean busy)
+                                                 :attachments (mapv #(.getName (io/file %)) @attached)
+                                                 :removed removed})]
+    (when (and (pos? (bit-and ev raw/CUI_COMPOSER_SEND)) sid (not busy))
+      (send-prompt! @current @draft @attached) (reset! draft "") (reset! attached []))
+    (when (pos? (bit-and ev raw/CUI_COMPOSER_ATTACH))
+      (let [out (atom "")]
+        (when (ui/app-file-dialog (ui/current-app) {:kind :open :title "Attach image" :filter-name "Images"
+                                                    :filter (str/join ";" (keys image-types))} out)
+          (attach! [@out]))))
+    (when (and (pos? (bit-and ev raw/CUI_COMPOSER_REMOVE)) (>= @removed 0))
+      (swap! attached #(into (subvec % 0 @removed) (subvec % (inc @removed)))))
+    (when (pos? (bit-and ev raw/CUI_COMPOSER_STOP)) (cancel!))))
 
-(defn prompts-dialog [u]
-  (ui/dialog u "Saved prompts" prompts-open
-             {:description "Click a prompt above the message box to put it in your message." :width 720}
-    (let [ps @prompts
-          i @prompt-sel]
-      (ui/row u {:width :fill :gap 16 :align :stretch}
-        (ui/scroll u {:id "prompt-list" :width 200 :height 300 :gap 4}
-          (doseq [[j pr] (map-indexed vector ps)]
-            (ui/push-id-int u j)
-            (when (ui/nav-item u (if (str/blank? (:title pr)) "Untitled" (:title pr))
-                               {:selected (= i j) :group "prompts"})
-              (edit-prompt! j))
-            (ui/pop-id u)))
-        (ui/column u {:width :fill :gap 10}
-          (if (< i (count ps))
-            (do
-              (ui/input u "ptitle" prompt-title {:label "Name" :width :fill})
-              (ui/textarea u "ptext" prompt-text {:label "Prompt" :height 200 :width :fill})
-              ;; read the selection again: a click in the list above may have
-              ;; just switched it, and the fields now hold the new prompt
-              (let [j @prompt-sel
-                    edited {:title @prompt-title :text @prompt-text}]
-                (when (and (< j (count @prompts)) (not= edited (get @prompts j)))
-                  (swap! prompts assoc j edited)
-                  (save-prompts!)))
-              (when (ui/button u "Delete" {:variant :danger :size :sm :icon :trash-2})
-                (swap! prompts #(into (subvec % 0 i) (subvec % (inc i))))
-                (save-prompts!)
-                (edit-prompt! (max 0 (dec i)))))
-            (ui/text u "No saved prompts yet." {:color :text-muted})))))
-    (ui/dialog-footer u
-      (when (ui/button u "New prompt" {:variant :outline :icon :plus})
-        (swap! prompts conj {:title "New prompt" :text ""})
-        (save-prompts!)
-        (edit-prompt! (dec (count @prompts))))
-      (when (ui/button u "Done" {:variant :primary}) (reset! prompts-open false)))))
-
-(defn conversation [u]
+(defn header []
   (let [n? @narrow
-        {:keys [sid turns busy usage parent]} (get @chats @current)]
-    (ui/column u {:width :fill :height :fill}
-      (ui/row u {:width :fill :pad-x (if n? 12 20) :pad-y 12 :gap (if n? 6 10) :align :center}
-        (when (and n? (ui/icon-button u :menu {:tooltip "Chats"})) (reset! drawer true))
-        (when (seq @models)
-          ;; a searchable select, since CUI's model-picker menu does not scroll
-          (when (ui/select u "model" (mapv :name @models) model {:searchable true :width 220})
-            (when sid (set-model! sid))))
-        (ui/spacer u)
-        (when (:size usage) (ui/context-meter u "ctx" (:used usage) (:size usage))))
-      (ui/separator u)
-      (when (not= @version @seen)
-        ;; ponytail: follows every update, even if you scrolled up mid-answer
-        (reset! seen @version)
-        (ui/scroll-to u "chat" 1e9))
-      (ui/scroll u {:id "chat" :width :fill :height :fill :fade-edges true}
-        (ui/row u {:width :fill :justify :center :pad-x (if n? 12 24) :pad-y (if n? 16 24)}
-          (ui/column u {:width :fill :max-width 760 :gap 14}
-            (cond
-              @status (ui/agent-status u @status {:status (if (str/starts-with? @status "Starting") :running :failed)})
-              (and (nil? sid) (empty? turns)) (ui/agent-status u "Starting a session" {:status :running})
-              (empty? turns) (empty-state u))
-            (when parent
-              (ui/row u {:gap 6 :align :center}
-                (ui/icon u :git-branch 14 :text-muted)
-                (ui/text u "Subchat of" {:size 13 :color :text-muted})
-                (when (ui/link u (:title (get @chats parent))) (reset! current parent))))
-            (doseq [[k t] (map-indexed vector turns)]
-              (if (= :user (:role t))
-                (do (when (seq (:images t)) (user-images u (:images t)))
-                    (when-not (str/blank? (:text t)) (ui/chat-message u (:text t) {:mine true :markdown true})))
-                (agent-turn u @current k t (:text (get turns (dec k))) busy))))))
-      (ui/row u {:width :fill :justify :center :pad-x (if n? 12 24) :pad-bottom (if n? 12 20)}
-        (ui/column u {:width :fill :max-width 760 :gap 8}
-          (prompt-bar u)
-          (let [removed (atom -1)
-                ev (ui/chat-composer u "composer" draft {:placeholder "Ask Claude" :busy (boolean busy)
-                                                         :attachments (mapv #(.getName (io/file %)) @attached)
-                                                         :removed removed})]
-            (when (and (pos? (bit-and ev raw/CUI_COMPOSER_SEND)) sid (not busy))
-              (send-prompt! @current @draft @attached) (reset! draft "") (reset! attached []))
-            (when (pos? (bit-and ev raw/CUI_COMPOSER_ATTACH))
-              (let [out (atom "")]
-                (when (ui/app-file-dialog (ui/current-app) {:kind :open :title "Attach image" :filter-name "Images"
-                                                            :filter (str/join ";" (keys image-types))} out)
-                  (attach! [@out]))))
-            (when (and (pos? (bit-and ev raw/CUI_COMPOSER_REMOVE)) (>= @removed 0))
-              (swap! attached #(into (subvec % 0 @removed) (subvec % (inc @removed)))))
-            (when (pos? (bit-and ev raw/CUI_COMPOSER_STOP)) (cancel!)))
-          (ui/text u "Claude can read and change files in the working directory."
-                   {:size 12 :color :text-muted :align :center :width :fill}))))))
+        {:keys [sid usage]} (get @chats @current)]
+    [:row {:width :fill :pad-x (if n? 12 20) :pad-y 12 :gap (if n? 6 10) :align :center}
+     (when n? [:icon-button {:icon :menu :tooltip "Chats" :on-click #(reset! drawer true)}])
+     (when (seq @models)
+       ;; a searchable select, since CUI's model-picker menu does not scroll
+       [:select {:id "model" :items (mapv :name @models) :index @model :searchable true :width 220
+                 :on-change #(do (reset! model %) (when sid (set-model! sid)))}])
+     [:spacer]
+     (when (:size usage) [:context-meter {:id "ctx" :used (:used usage) :limit (:size usage)}])]))
+
+(defn conversation []
+  (let [n? @narrow
+        st @status
+        cur @current
+        {:keys [sid turns busy parent]} (get @chats cur)]
+    [:column {:width :fill :height :fill}
+     [header]
+     [:separator]
+     [:scroll {:id "chat" :width :fill :height :fill :fade-edges true}
+      [:row {:width :fill :justify :center :pad-x (if n? 12 24) :pad-y (if n? 16 24)}
+       [:column {:width :fill :max-width 760 :gap 14}
+        (cond
+          st [:agent-status {:text st :status (if (str/starts-with? st "Starting") :running :failed)}]
+          (and (nil? sid) (empty? turns)) [:agent-status {:text "Starting a session" :status :running}]
+          (empty? turns) [empty-state])
+        (when parent
+          [:row {:gap 6 :align :center}
+           [:icon {:icon :git-branch :size 14 :color :text-muted}]
+           [:text {:text "Subchat of" :size 13 :color :text-muted}]
+           [:link {:text (:title (get @chats parent)) :on-click #(reset! current parent)}]])
+        (for [[k t] (map-indexed vector turns)]
+          (if (= :user (:role t))
+            [:column {:key [cur k] :width :fill :gap 8}
+             (when (seq (:images t)) [user-images (:images t)])
+             (when-not (str/blank? (:text t)) [:chat-message {:text (:text t) :mine true :markdown true}])]
+            [:column {:key [cur k] :width :fill}
+             [agent-turn cur k t (:text (get turns (dec k))) busy]]))]]]
+     [:row {:width :fill :justify :center :pad-x (if n? 12 24) :pad-bottom (if n? 12 20)}
+      [:column {:width :fill :max-width 760 :gap 8}
+       [prompt-bar]
+       [:cui/immediate {:render composer-frame}]
+       [:text {:text "Claude can read and change files in the working directory."
+               :size 12 :color :text-muted :align :center :width :fill}]]]]))
 
 (def plan-status {"pending" :pending "in_progress" :running "completed" :done})
 
-(defn side-panel [u]
+(defn side-panel []
   (let [{:keys [plan usage turns]} (get @chats @current)
-        tools (for [t turns, it (:items t) :when (= :tool (:type it))] it)]
-    (ui/column u {:width 330 :height :fill :bg :surface :pad 20 :gap 16}
-      (ui/text u "Workspace" {:font :medium :size 15})
-      (ui/label u "Folder")
-      (ui/row u {:gap 10 :align :center :width :fill :pad 8 :radius 12 :bg :surface-muted}
-        (ui/icon u :folder 16 :text-secondary)
-        (ui/text u @cwd {:size 13 :width :fill :nowrap true}))
-      (if (seq plan)
-        (ui/agent-plan u "plan" (mapv (fn [e] {:title (:content e) :status (plan-status (:status e) :pending)}) plan)
-                       {:title "Plan"})
-        (ui/text u "Claude shows its plan here when a task has several steps."
-                 {:size 13 :color :text-muted}))
-      (ui/label u "Saved chats")
-      (ui/row u {:gap 10 :align :center :width :fill :pad 8 :radius 12 :bg :surface-muted}
-        (ui/icon u (if @save-error :circle-alert :file-text) 16 :text-secondary)
-        (ui/text u (or @save-error chats-dir) {:size 13 :width :fill :nowrap true}))
-      (ui/label u "Session")
-      (ui/text u (str (count tools) (if (= 1 (count tools)) " tool call" " tool calls")) {:size 13 :color :text-secondary})
-      (when-let [c (:cost usage)]
-        (ui/text u (format "Cost %.2f %s" (double (:amount c)) (:currency c)) {:size 13 :color :text-secondary})))))
+        tools (for [t turns, it (:items t) :when (= :tool (:type it))] it)
+        err @save-error]
+    [:column {:width 330 :height :fill :bg :surface :pad 20 :gap 16}
+     [:text {:text "Workspace" :font :medium :size 15}]
+     [:label {:label "Folder"}]
+     [:row {:gap 10 :align :center :width :fill :pad 8 :radius 12 :bg :surface-muted}
+      [:icon {:icon :folder :size 16 :color :text-secondary}]
+      [:text {:text @cwd :size 13 :width :fill :nowrap true}]]
+     (if (seq plan)
+       [:agent-plan {:id "plan" :title "Plan"
+                     :steps (mapv (fn [e] {:title (:content e) :status (plan-status (:status e) :pending)}) plan)}]
+       [:text {:text "Claude shows its plan here when a task has several steps." :size 13 :color :text-muted}])
+     [:label {:label "Saved chats"}]
+     [:row {:gap 10 :align :center :width :fill :pad 8 :radius 12 :bg :surface-muted}
+      [:icon {:icon (if err :circle-alert :file-text) :size 16 :color :text-secondary}]
+      [:text {:text (or err chats-dir) :size 13 :width :fill :nowrap true}]]
+     [:label {:label "Session"}]
+     [:text {:text (str (count tools) (if (= 1 (count tools)) " tool call" " tool calls"))
+             :size 13 :color :text-secondary}]
+     (when-let [c (:cost usage)]
+       [:text {:text (format "Cost %.2f %s" (double (:amount c)) (:currency c)) :size 13 :color :text-secondary}])]))
 
-(defn permission-dialog [u]
+(defn permission-dialog []
   (when-let [{:keys [title options]} (first @perms)]
-    (ui/dialog u "Claude wants to run a tool" perm-open {:description title :persistent true :no-close-button true}
-      (ui/dialog-footer u
-        (doseq [{:keys [optionId name kind]} options]
-          (ui/push-id u optionId)
-          (when (ui/button u name {:variant (if (str/starts-with? kind "allow") :primary :outline)})
-            (answer-permission! {:outcome "selected" :optionId optionId}))
-          (ui/pop-id u))))))
+    [:dialog {:title "Claude wants to run a tool" :open @perm-open :description title
+              :persistent true :no-close-button true}
+     [:dialog-footer
+      (for [{:keys [optionId name kind]} options]
+        [:button {:key optionId :label name :variant (if (str/starts-with? kind "allow") :primary :outline)
+                  :on-click #(answer-permission! {:outcome "selected" :optionId optionId})}])]]))
 
-(defn branch-dialog [u]
+(defn pick-block! [j]
+  (let [{:keys [blocks picked]} @branch
+        p (if (picked j) (disj picked j) (conj picked j))]
+    (swap! branch assoc :picked p)
+    (reset! branch-quote (str/join "\n\n" (map blocks (sort p))))))
+
+(defn branch-blocks
+  "The reply's parts as cards to pick. A card's click is the return of
+  cui_card_begin, which glimmer-cui's :card drops, so this is an island."
+  [blocks picked]
+  [:cui/immediate
+   {:render (fn [u]
+              (ui/scroll u {:id "blocks" :width :fill :height 260 :gap 8}
+                (doseq [[j b] (map-indexed vector blocks)]
+                  (ui/push-id-int u j)
+                  (let [clicked (ui/card-begin u {:hoverable true :selected (contains? picked j) :pad 10 :width :fill})]
+                    (ui/markdown u "b" b {:width :fill :size 13.5 :compact true})
+                    (ui/card-end u)
+                    (when clicked (pick-block! j)))
+                  (ui/pop-id u))))}])
+
+(defn branch-dialog []
   ;; CUI text has no mouse selection, so you pick whole parts and trim the quote
   (when-let [{:keys [chat turn blocks picked]} @branch]
-    (ui/dialog u "Start a subchat" branch-open
-               {:description "Pick the parts of the reply to ask about. This chat stays as it is." :width 640}
-      (ui/scroll u {:id "blocks" :width :fill :height 260 :gap 8}
-        (doseq [[j b] (map-indexed vector blocks)]
-          (ui/push-id-int u j)
-          (let [clicked (ui/card-begin u {:hoverable true :selected (contains? picked j) :pad 10 :width :fill})]
-            (ui/markdown u "b" b {:width :fill :size 13.5 :compact true})
-            (ui/card-end u)
-            (when clicked
-              (let [p (if (picked j) (disj picked j) (conj picked j))]
-                (swap! branch assoc :picked p)
-                (reset! branch-quote (str/join "\n\n" (map blocks (sort p)))))))
-          (ui/pop-id u)))
-      (ui/textarea u "quote" branch-quote {:label "Quote" :placeholder "Pick parts above, then cut this down to what matters"
-                                           :height 90 :width :fill})
-      (let [ev (ui/input u "ask" branch-ask {:label "Your message" :placeholder "What do you want to know about it?"
-                                             :autofocus true :width :fill})
-            ready (not (str/blank? (quoted @branch-quote @branch-ask)))
-            go (fn [] (reset! branch-open false) (branch! chat turn @branch-quote @branch-ask))]
-        (when (and ready (pos? (bit-and ev raw/CUI_SUBMITTED))) (go))
-        (ui/dialog-footer u
-          (when (ui/button u "Cancel" {:variant :ghost}) (reset! branch-open false))
-          (when (ui/button u "Start subchat" {:variant :primary :icon :git-branch :disabled (not ready)}) (go)))))))
+    (let [q @branch-quote
+          ask @branch-ask
+          ready (not (str/blank? (quoted q ask)))
+          go #(do (reset! branch-open false) (branch! chat turn @branch-quote @branch-ask))]
+      [:dialog {:title "Start a subchat" :open @branch-open :on-close #(reset! branch-open false)
+                :description "Pick the parts of the reply to ask about. This chat stays as it is." :width 640}
+       [branch-blocks blocks picked]
+       [:textarea {:id "quote" :value q :label "Quote" :height 90 :width :fill
+                   :placeholder "Pick parts above, then cut this down to what matters"
+                   :on-change #(reset! branch-quote %)}]
+       [:input {:value ask :label "Your message" :placeholder "What do you want to know about it?"
+                :autofocus true :width :fill
+                :on-change #(reset! branch-ask %)
+                :on-submit #(when ready (go))}]
+       [:dialog-footer
+        [:button {:label "Cancel" :variant :ghost :on-click #(reset! branch-open false)}]
+        [:button {:label "Start subchat" :variant :primary :icon :git-branch :disabled (not ready) :on-click go}]]])))
 
-(defn frame [u]
-  (let [vw (:x (ui/viewport-size u))]
-    (when (and @conn (acp/busy? @conn))
-      ;; agent updates arrive on another thread; poll while a request is open
-      (ui/request-wakeup u 0.05))
-    (attach! (map #(ui/dropped-file u %) (range (ui/dropped-file-count u))))
-    (reset! narrow (< vw 760))
-    (when-not @narrow (reset! drawer false))
-    (ui/row u {:width :fill :height :fill :align :stretch :bg :background}
-      (when-not @narrow (sidebar u false) (ui/separator u))
-      (conversation u)
-      (when (>= vw 1180) (ui/separator u) (side-panel u)))
-    (ui/sheet u "Muse" drawer {:side :left :size 300}
-      (sidebar u true))
-    (branch-dialog u)
-    (prompts-dialog u)
-    (permission-dialog u)))
+(defn prompt-editor [i]
+  (let [p (get @prompts i)]
+    [:column {:width :fill :gap 10}
+     [:input {:value (:title p) :label "Name" :width :fill :on-change #(update-prompt! i :title %)}]
+     [:textarea {:id "ptext" :value (:text p) :label "Prompt" :height 200 :width :fill
+                 :on-change #(update-prompt! i :text %)}]
+     [:button {:label "Delete" :variant :danger :size :sm :icon :trash-2
+               :on-click (fn []
+                           (swap! prompts #(into (subvec % 0 i) (subvec % (inc i))))
+                           (save-prompts!)
+                           (edit-prompt! (max 0 (dec i))))}]]))
+
+(defn prompts-dialog []
+  (let [ps @prompts
+        i @prompt-sel]
+    [:dialog {:title "Saved prompts" :open @prompts-open :on-close #(reset! prompts-open false)
+              :description "Click a prompt above the message box to put it in your message." :width 720}
+     [:row {:width :fill :gap 16 :align :stretch}
+      [:scroll {:id "prompt-list" :width 200 :height 300 :gap 4}
+       (for [[j pr] (map-indexed vector ps)]
+         [:nav-item {:key j :label (if (str/blank? (:title pr)) "Untitled" (:title pr))
+                     :selected (= i j) :group "prompts" :on-click #(edit-prompt! j)}])]
+      (if (< i (count ps))
+        ;; keyed by the prompt, so switching prompts gives fresh fields
+        ^{:key i} [prompt-editor i]
+        [:text {:text "No saved prompts yet." :color :text-muted}])]
+     [:dialog-footer
+      [:button {:label "New prompt" :variant :outline :icon :plus
+                :on-click #(do (swap! prompts conj {:title "New prompt" :text ""})
+                               (save-prompts!)
+                               (edit-prompt! (dec (count @prompts))))}]
+      [:button {:label "Done" :variant :primary :on-click #(reset! prompts-open false)}]]]))
+
+(defn window-frame
+  "Runs every frame: tracks the window width and takes dropped files."
+  [u]
+  (let [vw (:x (ui/viewport-size u))
+        n? (< vw 760)
+        w? (>= vw 1180)]
+    (when (not= n? @narrow) (reset! narrow n?) (when-not n? (reset! drawer false)))
+    (when (not= w? @wide) (reset! wide w?))
+    (attach! (map #(ui/dropped-file u %) (range (ui/dropped-file-count u))))))
+
+(defn app []
+  [:column {:width :fill :height :fill}
+   [:cui/immediate {:render window-frame}]
+   [:row {:width :fill :height :fill :align :stretch :bg :background}
+    (when-not @narrow (list [sidebar false] [:separator]))
+    [conversation]
+    (when @wide (list [:separator] [side-panel]))]
+   [:sheet {:title "Muse" :open @drawer :side :left :size 300 :on-change #(reset! drawer %)}
+    [sidebar true]]
+   [branch-dialog]
+   [prompts-dialog]
+   [permission-dialog]])
+
+(defn tick!
+  "Moves the clock once a second while a chat is busy, for the timers."
+  []
+  (future (loop [] (Thread/sleep 1000) (when (some :busy @chats) (reset! clock (now))) (recur))))
 
 (defn -main [& [dir]]
   (when dir (reset! cwd dir))
   (reset! prompts (load-prompts))
   (start!)
+  (tick!)
   (try
-    (ui/run {:title "Muse" :width 1440 :height 900 :theme :dark :accent :neutral} frame)
+    (g/run app :title "Muse" :width 1440 :height 900 :theme :dark :accent :neutral)
     (finally (acp/close! @conn))))

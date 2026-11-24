@@ -1,7 +1,11 @@
-{:paths ["src"]
+{:jolt/min-version "0.8.25"
 
- ;; cui-jolt is expected next to this repo, with libcui built (`jolt native` there)
- :deps {io.github.jlt-commons/cui-jolt {:local/root "../cui-jolt"}}
+ :paths ["src"]
+
+ ;; glimmer-cui brings glimmer (components, ratoms) and cui-jolt (the CUI
+ ;; binding), and builds its own libcui with the cross-thread wake patch.
+ :deps {jolt-lang/glimmer-cui {:git/url "https://github.com/jolt-lang/glimmer-cui"
+                               :git/sha "9e9a4a070e7db5cd95451068941e6a31037b88f0"}}
 
  :aliases {:test {:extra-paths ["test"]}}
 
