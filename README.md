@@ -1,12 +1,12 @@
-# Muse
+# Urania
 
-A desktop chat app for Claude, written in [Jolt](https://jolt-lang.net) (Clojure on Chez
+Urania (the app calls itself Muse) is a desktop chat app for Claude, written in [Jolt](https://jolt-lang.net) (Clojure on Chez
 Scheme) with [cui-jolt](https://github.com/jlt-commons/cui-jolt). Its layout follows CUI's
 [`assistant.c`](https://yappologistic.github.io/CUI/#/app/assistant).
 
 ![Muse](docs/images/assistant.png)
 
-Muse starts [`claude-agent-acp`](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
+It starts [`claude-agent-acp`](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)
 with `npx` and talks to it over the [Agent Client Protocol](https://agentclientprotocol.com)
 (`src/acp.clj`). It has:
 
@@ -23,6 +23,7 @@ You need Jolt, Node and a logged-in Claude Code. cui-jolt must sit next to this 
 libcui built:
 
 ```sh
+git clone https://github.com/fricze/urania && cd urania
 git clone https://github.com/jlt-commons/cui-jolt ../cui-jolt
 (cd ../cui-jolt && jolt native)
 jolt start        # start Muse in the current directory
