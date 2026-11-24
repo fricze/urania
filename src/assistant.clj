@@ -737,15 +737,29 @@
    [permission-dialog]])
 
 (defn tick!
-  "Moves the clock once a second while a chat is busy, for the timers."
-  []
-  (future (loop [] (Thread/sleep 1000) (when (some :busy @chats) (reset! clock (now))) (recur))))
+  "Moves the clock once a second while a chat is busy, for the timers, until
+  running is reset to false. Returns the thread's future."
+  [running]
+  (future (while @running
+            (Thread/sleep 1000)
+            (when (some :busy @chats) (reset! clock (now))))))
 
 (defn -main [& [dir]]
   (when dir (reset! cwd dir))
   (reset! prompts (load-prompts))
   (start!)
-  (tick!)
-  (try
-    (g/run app :title "Muse" :width 1440 :height 900 :theme :dark :accent :neutral)
-    (finally (acp/close! @conn))))
+  ;; every thread must end once the window closes, or the process (and the
+  ;; closed window with it) stays alive after Cmd-Q
+  (let [running (atom true)
+        ticker (tick! running)]
+    (try
+      (g/run app :title "Muse" :width 1440 :height 900 :theme :dark :accent :neutral)
+      (finally
+        (reset! running false)
+        ;; ends the agent; its reader threads finish when its pipes close,
+        ;; after any chat save they are in the middle of
+        (acp/close! @conn)
+        @ticker
+        ;; futures run on a non-daemon pool that keeps the process alive even
+        ;; when idle; this lets running ones finish, then releases it
+        (shutdown-agents)))))
